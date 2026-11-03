@@ -1,0 +1,24 @@
+name: check
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+jobs:
+  syntax:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Компиляция
+        run: python -m py_compile vpnguard
+      - name: Справка
+        run: python -I vpnguard --help
+      - name: Установщик
+        run: sh -n install.sh
