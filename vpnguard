@@ -1,4 +1,4 @@
-#!/opt/homebrew/bin/python3 -I
+#!/usr/bin/env -S python3 -I
 """vpnguard: сторож для Happ на macOS.
 
 Каждые несколько секунд проверяет связь по уровням: Wi-Fi/роутер, прямой
