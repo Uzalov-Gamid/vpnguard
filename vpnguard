@@ -6,7 +6,7 @@
 если сломан именно он, поэтому плохой Wi-Fi не вызывает лишних перезапусков.
 """
 import argparse, collections, concurrent.futures as cf, json, math, os, plistlib, re, shutil, signal
-import select, statistics, subprocess, sys, termios, threading, time, tty
+import select, statistics, subprocess, sys, termios, textwrap, threading, time, tty
 from pathlib import Path
 
 HOME = Path.home()
@@ -14,6 +14,8 @@ LOG = HOME / "Library/Logs/vpnguard.jsonl"
 BIN = HOME / ".local/bin/vpnguard"
 ALIAS = HOME / ".local/bin/vpn"
 AGENT = HOME / "Library/LaunchAgents/com.vpnguard.plist"
+CONF = HOME / ".config/vpnguard/happ.json"
+IP_CACHE = HOME / ".cache/vpnguard/ip.json"
 HAPP_PREFS = HOME / "Library/Group Containers/group.su.ffg.happ.ruplus2/Library/Preferences/group.su.ffg.happ.ruplus2.plist"
 ACCESS_LOG = HAPP_PREFS.parents[1] / "Application Support/Xray/logs/access.log"
 SPEED_DOWN = "https://speed.cloudflare.com/__down?bytes=25000000"
@@ -22,15 +24,27 @@ PROBE_URL = "https://www.gstatic.com/generate_204"
 TRACE_URL = "https://1.1.1.1/cdn-cgi/trace"
 DIRECT_HOST = "77.88.8.8"
 GW_SLOW_MS = 500
+# Эталон раздельной маршрутизации: российские сайты должны идти напрямую, остальные через VPN
+SITES = [("ya.ru", "RU"), ("vk.com", "RU"), ("www.gosuslugi.ru", "RU"), ("www.ozon.ru", "RU"),
+         ("www.sberbank.ru", "RU"), ("www.youtube.com", "VPN"), ("github.com", "VPN"),
+         ("chatgpt.com", "VPN"), ("www.instagram.com", "VPN"), ("web.telegram.org", "VPN")]
+RU_HINTS = ("yandex.ru", "yandex.net", "yastatic", "vk.com", "vk.me", "userapi.com", "mail.ru", "ok.ru",
+            "avito", "ozon", "wildberries", "wb.ru", "gosuslugi", "sber", "tbank", "tinkoff", "kinopoisk",
+            "dzen", "rutube", "mos.ru")
+NOISE = {"www.gstatic.com", "1.1.1.1", "8.8.8.8", "speed.cloudflare.com"}  # собственные проверки vpnguard
+SERVICE_TAGS = {"DIRECT", "BLOCK", "dns-out"}
 
 LABELS = {
     "OK": "всё работает",
     "LOCAL": "сбой Wi-Fi/роутера, VPN не виноват",
     "ISP": "роутер отвечает, но нет прямого интернета",
     "VPN_BROKEN": "сеть в порядке, но через VPN трафик не идёт",
+    "LEAK": "серверы VPN недоступны, Happ пустил трафик напрямую",
     "VPN_DOWN": "туннель Happ выключен",
 }
-LABELS_SHORT = dict(OK="Норма", LOCAL="Wi-Fi", VPN_BROKEN="Сбой VPN")
+LABELS_SHORT = dict(OK="Норма", LOCAL="Wi-Fi", ISP="Провайдер", VPN_BROKEN="Сбой VPN", LEAK="Обход VPN",
+                    VPN_DOWN="Выключен")
+BROKEN = ("VPN_BROKEN", "LEAK")
 
 
 def run(cmd, timeout):
@@ -74,13 +88,40 @@ def socks_port():
         return "10808"
 
 
-def proxy_ms(port, timeout=6):
-    cmd = ["curl", "-s", "-o", "/dev/null", "-m", str(timeout), "-x", f"socks5h://127.0.0.1:{port}",
-           "-w", "%{http_code} %{time_total}", PROBE_URL]
+def access_tail(size):
+    try:
+        with ACCESS_LOG.open("rb") as f:
+            f.seek(max(ACCESS_LOG.stat().st_size - size, 0))
+            return f.read().decode(errors="ignore")
+    except OSError:
+        return ""
+
+
+def outbound_of(lport, size=40_000):
+    """Какой outbound Happ выбрал для нашего запроса: строку журнала находим по локальному порту curl."""
+    for _ in range(3):
+        m = re.search(rf"from tcp:127\.0\.0\.1:{lport} accepted \S+ \[\S+ (?:->|>>) ([\w-]+)\]", access_tail(size))
+        if m:
+            return m.group(1)
+        time.sleep(0.2)
+    return None
+
+
+def via_proxy(port, url, timeout):
+    """Запрос через SOCKS Happ: (код, мс, локальный порт) или None."""
+    cmd = ["curl", "-sk", "-o", "/dev/null", "-m", str(timeout), "-x", f"socks5h://127.0.0.1:{port}",
+           "-w", "%{http_code} %{time_total} %{local_port}", url]
     out = run(cmd, timeout + 1)
-    if not out or not out.stdout.startswith("204"):
-        return None
-    return float(out.stdout.split()[1]) * 1000
+    p = out.stdout.split() if out else []
+    return (p[0], float(p[1]) * 1000, p[2]) if len(p) == 3 else None
+
+
+def proxy_ms(port, timeout=6):
+    """Задержка через VPN и сервер, который её обслужил. DIRECT значит обход туннеля."""
+    r = via_proxy(port, PROBE_URL, timeout)
+    if not r or r[0] != "204":
+        return None, None
+    return r[1], outbound_of(r[2])
 
 
 def location(args):
@@ -89,7 +130,7 @@ def location(args):
     return m.group(1) if m else None
 
 
-def classify(vpn_up, gw, direct, proxy):
+def classify(vpn_up, gw, direct, proxy, tag=None):
     """Уровень сбоя; снизу вверх, потому что верхний уровень зависит от нижнего."""
     if gw is None or gw > GW_SLOW_MS:
         return "LOCAL"
@@ -97,7 +138,10 @@ def classify(vpn_up, gw, direct, proxy):
         return "ISP"
     if not vpn_up:
         return "VPN_DOWN"
-    return "OK" if proxy is not None else "VPN_BROKEN"
+    if proxy is None:
+        return "VPN_BROKEN"
+    # балансировщик Happ при падении всех серверов уходит в fallbackTag DIRECT: проверка проходит, но мимо VPN
+    return "LEAK" if tag == "DIRECT" else "OK"
 
 
 def sample(port):
@@ -107,9 +151,10 @@ def sample(port):
         gw = ex.submit(ping_once, gw_ip, iface) if gw_ip else None
         direct = ex.submit(ping_once, DIRECT_HOST, iface, 3) if iface else None
         proxy = ex.submit(proxy_ms, port)
-        r = dict(gw=gw.result() if gw else None, direct=direct.result() if direct else None, proxy=proxy.result())
+        ms, tag = proxy.result()
+        r = dict(gw=gw.result() if gw else None, direct=direct.result() if direct else None, proxy=ms, tag=tag)
     r["vpn"] = st == "Connected"
-    r["state"] = classify(r["vpn"], r["gw"], r["direct"], r["proxy"])
+    r["state"] = classify(r["vpn"], r["gw"], r["direct"], r["proxy"], tag)
     return r
 
 
@@ -141,6 +186,228 @@ def restart_tunnel():
     return False
 
 
+def start_tunnel():
+    sid, st = service()
+    if not sid or st == "Connected":
+        return st == "Connected"
+    run(["scutil", "--nc", "start", sid], 10)
+    for _ in range(20):
+        time.sleep(1)
+        if service()[1] == "Connected":
+            return True
+    return False
+
+
+def happ_config():
+    try:
+        return json.loads(CONF.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def server_list(conf=None):
+    """Серверы из конфига Happ: тег, адрес, порт, SNI. Конфиг Happ хранит зашифрованным, поэтому его импортируют."""
+    rows = []
+    for o in (conf or happ_config() or {}).get("outbounds", []):
+        s = o.get("settings", {})
+        peers = s.get("vnext") or s.get("servers") or []
+        if not peers:
+            continue
+        st = o.get("streamSettings", {})
+        tls = st.get("tlsSettings") or st.get("realitySettings") or {}
+        rows.append(dict(tag=o.get("tag", "?"), host=peers[0].get("address"), port=int(peers[0].get("port", 443)),
+                         sni=tls.get("serverName") or peers[0].get("address"), net=st.get("network", "tcp"),
+                         sec=st.get("security", "none"), proto=o.get("protocol")))
+    return rows
+
+
+def doh(name, iface):
+    """IPv4 адрес мимо туннеля: когда VPN сломан, его DNS тоже не отвечает."""
+    if re.fullmatch(r"[\d.]+", name):
+        return name
+    for url in (f"https://1.1.1.1/dns-query?name={name}&type=A", f"https://8.8.8.8/resolve?name={name}&type=A"):
+        out = run(["curl", "-s", "-m", "4", "--interface", iface, "-H", "accept: application/dns-json", url], 5)
+        try:
+            answer = json.loads(out.stdout).get("Answer", []) if out else []
+        except ValueError:
+            continue
+        ips = [a["data"] for a in answer if a.get("type") == 1]
+        if ips:
+            return ips[0]
+    return None
+
+
+def probe_server(srv, iface):
+    """TCP и TLS до сервера напрямую через Wi-Fi: так видно, режет ли его провайдер."""
+    ip = doh(srv["host"], iface)
+    if not ip:
+        return dict(srv, ip=None, tcp=None, tls=None, err="DNS")
+    tls_on = srv["sec"] in ("tls", "reality")
+    scheme = "https" if tls_on else "http"
+    cmd = ["curl", "-sk", "-o", "/dev/null", "-m", "6", "--interface", iface,
+           "--connect-to", f"{srv['sni']}:{srv['port']}:{ip}:{srv['port']}",
+           "-w", "%{time_connect} %{time_appconnect}", f"{scheme}://{srv['sni']}:{srv['port']}/"]
+    out = run(cmd, 7)
+    try:
+        tcp, tls = (float(x) * 1000 for x in out.stdout.split())
+    except (AttributeError, ValueError):
+        tcp = tls = 0
+    if not tls_on:
+        tls = tcp
+    err = None if tcp and tls else "TLS" if tcp else "TCP"
+    return dict(srv, ip=ip, tcp=tcp or None, tls=tls or None, err=err)
+
+
+def probe_servers():
+    iface = route()[1]
+    servers = server_list()
+    if not iface or not servers:
+        return []
+    with cf.ThreadPoolExecutor(8) as ex:
+        return list(ex.map(lambda s: probe_server(s, iface), servers))
+
+
+CONN = re.compile(r"accepted (?:tcp|udp):(\[[^\]]+\]|[^\s:]+):\d+ \[\S+ (?:->|>>) ([\w-]+)\]")
+ANSWER = re.compile(r"(?:got answer|cache HIT): (\S+?)\.? -> \[([^\]]*)\]")
+IP_INFO = {}
+IP_RE = re.compile(r"[\d.]+")
+
+
+def txt(name, iface):
+    out = run(["curl", "-s", "-m", "4", "--interface", iface, "-H", "accept: application/dns-json",
+               f"https://1.1.1.1/dns-query?name={name}&type=TXT"], 5)
+    try:
+        return [a["data"].strip('"') for a in json.loads(out.stdout).get("Answer", [])] if out else []
+    except ValueError:
+        return []
+
+
+def lookup_ip(ip, iface):
+    """Страна и владелец сети по IP через DNS Team Cymru: имён в журнале нет, а страна видна всегда."""
+    rev = ".".join(reversed(ip.split(".")))
+    origin = txt(f"{rev}.origin.asn.cymru.com", iface)
+    if not origin:
+        return dict(cc=None, org=None)
+    asn, _, cc = [x.strip() for x in origin[0].split("|")[:3]]
+    org = (txt(f"AS{asn.split()[0]}.asn.cymru.com", iface) or ["||||"])[0].split("|")[-1].strip()
+    org = re.sub(r",\s*[A-Z]{2}$", "", org)
+    org = org.split(" - ", 1)[1] if " - " in org else org.split(" ", 1)[1] if " " in org else org
+    return dict(cc=cc or None, org=org or f"AS{asn}")
+
+
+def enrich(ips, limit=25):
+    """Подтягивает сведения о новых IP в фоне; кэш на диске, чтобы не спрашивать повторно."""
+    if not IP_INFO:
+        try:
+            IP_INFO.update(json.loads(IP_CACHE.read_text()))
+        except (OSError, ValueError):
+            pass
+    todo = [ip for ip in ips if IP_RE.fullmatch(ip) and ip not in IP_INFO][:limit]
+    iface = route()[1]
+    if not todo or not iface:
+        return
+    with cf.ThreadPoolExecutor(8) as ex:
+        IP_INFO.update(zip(todo, ex.map(lambda ip: lookup_ip(ip, iface), todo)))
+    IP_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    IP_CACHE.write_text(json.dumps(IP_INFO))
+
+
+def host_label(host):
+    info = IP_INFO.get(host)
+    return f"{info['org']} · {host}" if info and info["org"] else host
+
+
+def is_ru_host(host):
+    return is_ru(host) or (IP_INFO.get(host) or {}).get("cc") == "RU"
+
+
+def is_ru(host):
+    host = host.lower()
+    return host.endswith((".ru", ".su", ".xn--p1ai", ".рф")) or any(k in host for k in RU_HINTS)
+
+
+def access_stats(size=600_000, lookup=25):
+    """Куда Happ отправляет трафик: доли маршрутов, хосты и российские сайты, ушедшие в VPN.
+
+    Системный трафик попадает в журнал по IP, поэтому имена восстанавливаются из ответов DNS в том же журнале.
+    """
+    text = access_tail(size)
+    names = {}
+    for dom, ips in ANSWER.findall(text):
+        for ip in ips.split(","):
+            names[ip.strip()] = dom.rstrip(".")
+    tags, hosts = collections.Counter(), collections.Counter()
+    for host, tag in CONN.findall(text):
+        if host in NOISE or tag == "dns-out":
+            continue
+        tags[tag] += 1
+        hosts[(names.get(host, host), tag)] += 1
+    if lookup:
+        enrich([h for (h, _), _ in hosts.most_common(lookup * 2)], lookup)
+    ru = collections.Counter()
+    for (h, t), n in hosts.items():
+        if t not in SERVICE_TAGS and is_ru_host(h):
+            ru[host_label(h)] += n
+    return dict(tags=tags, hosts=hosts, ru=ru)
+
+
+def servers(st=None):
+    """Какие серверы Happ реально использует: доля соединений в хвосте журнала."""
+    tags = (st or access_stats())["tags"]
+    used = {t: n for t, n in tags.items() if t not in SERVICE_TAGS}
+    total = sum(used.values()) or 1
+    return [(t, n / total) for t, n in sorted(used.items(), key=lambda kv: -kv[1])]
+
+
+def route_check(port):
+    """Открывает эталонные сайты через Happ и по журналу смотрит, каким маршрутом они ушли."""
+    with cf.ThreadPoolExecutor(len(SITES)) as ex:
+        res = list(ex.map(lambda s: via_proxy(port, f"https://{s[0]}/", 8), SITES))
+    time.sleep(0.3)
+    rows = []
+    for (host, want), r in zip(SITES, res):
+        tag = outbound_of(r[2], 200_000) if r else None
+        works = bool(r and r[0] != "000")
+        right = tag == "DIRECT" if want == "RU" else tag not in (None, "DIRECT", "BLOCK")
+        rows.append(dict(host=host, want=want, tag=tag, works=works, ms=r[1] if r else None, right=right))
+    return rows
+
+
+def advice(state, probes, routes=None):
+    """Человеческий вывод: что сломано и что сделать."""
+    tips = []
+    dead = [p["tag"] for p in probes if p["err"]]
+    if state == "LOCAL":
+        tips.append("Слабый Wi-Fi или роутер: подойди ближе, перезагрузи роутер. VPN тут ни при чём.")
+    elif state == "ISP":
+        tips.append("Роутер отвечает, но интернета нет: проблема у провайдера.")
+    elif state == "VPN_DOWN":
+        tips.append("Туннель выключен: включи Happ или запусти «vpn watch --keep-on».")
+    if probes and len(dead) == len(probes):
+        reasons = ", ".join(sorted({p["err"] for p in probes}))
+        tips.append(f"Ни один сервер не отвечает из твоей сети ({reasons}): похоже на блокировку провайдером "
+                    "или серверы лежат. Обнови подписку в Happ или выбери другую локацию.")
+    elif dead:
+        tips.append(f"Не отвечают: {', '.join(dead)}. Балансировщик Happ обходит их сам, но если тормозит, "
+                    "выбери в Happ другой сервер.")
+    if state in BROKEN and probes and not dead:
+        tips.append("Серверы доступны, но трафик через туннель не идёт: перезапусти туннель (vpn restart), "
+                    "если не поможет, обнови подписку в Happ.")
+    if state == "LEAK":
+        tips.append("Happ переключился на прямое соединение (fallback DIRECT): заблокированные сайты не "
+                    "откроются, а сайты видят твой настоящий IP.")
+    for r in routes or []:
+        if r["want"] == "RU" and r["tag"] not in (None, "DIRECT"):
+            tips.append(f"{r['host']} идёт через VPN ({r['tag']}): российские сайты могут не открываться "
+                        "из-за зарубежного IP. В Happ включи маршрутизацию «RU напрямую».")
+            break
+    for r in routes or []:
+        if r["want"] == "VPN" and r["tag"] == "DIRECT":
+            tips.append(f"{r['host']} идёт напрямую, мимо VPN: проверь правила маршрутизации в Happ.")
+            break
+    return tips
+
+
 def fmt(v):
     return "нет ответа" if v is None else f"{v:.0f} мс"
 
@@ -150,6 +417,7 @@ def cmd_status(a):
     print(f"Состояние:  {LABELS[r['state']]}")
     print(f"Роутер:     {fmt(r['gw'])}\nИнтернет:   {fmt(r['direct'])}")
     print(f"Туннель:    {'включён' if r['vpn'] else 'выключен'}\nЧерез VPN:  {fmt(r['proxy'])}")
+    print(f"Сервер:     {r['tag'] or '?'}")
     return 0 if r["state"] == "OK" else 1
 
 
@@ -164,11 +432,29 @@ def summary(name, values):
     return loss, p95
 
 
+def print_servers(probes, shares):
+    share = dict(shares)
+    print(f"{'Сервер':10} {'Адрес':24} {'IP':16} {'TCP':>8} {'TLS':>8} {'Доля':>6}")
+    for p in probes:
+        mark = f"{RED}✗ {p['err']}{RESET}" if p["err"] else f"{GREEN}✓{RESET}"
+        print(f"{p['tag']:10} {cut(p['host'], 24):24} {p['ip'] or '—':16} {short_ms(p['tcp']):>8} "
+              f"{short_ms(p['tls']):>8} {share.get(p['tag'], 0) * 100:5.0f}%  {mark}")
+
+
+def print_routes(rows):
+    print(f"{'Сайт':20} {'Нужно':7} {'Маршрут':10} {'Ответ':>8}")
+    for r in rows:
+        want = "напрямую" if r["want"] == "RU" else "VPN"
+        mark = f"{GREEN}✓{RESET}" if r["right"] and r["works"] else f"{YELLOW}не открылся{RESET}" if r["right"] \
+            else f"{RED}✗ не тот маршрут{RESET}"
+        print(f"{r['host']:20} {want:7} {r['tag'] or '?':10} {short_ms(r['ms']) if r['works'] else 'нет':>8}  {mark}")
+
+
 def cmd_doctor(a):
     port, n = socks_port(), a.seconds
     gw_ip, iface = route()
     print(f"Замер {n} с, не закрывай ноутбук…")
-    gw, direct, proxy = [], [], []
+    gw, direct, proxy, tags = [], [], [], []
 
     def series(fn, sink, step):
         end = time.time() + n
@@ -177,30 +463,56 @@ def cmd_doctor(a):
             sink.append(fn())
             time.sleep(max(step - (time.time() - start), 0))
 
-    with cf.ThreadPoolExecutor(3) as ex:
+    def probe():
+        ms, tag = proxy_ms(port)
+        tags.append(tag)
+        return ms
+
+    with cf.ThreadPoolExecutor(5) as ex:
+        background = ex.submit(lambda: (probe_servers(), route_check(port)))
         list(ex.map(lambda t: series(*t), [
             (lambda: ping_once(gw_ip, iface), gw, 1),
             (lambda: ping_once(DIRECT_HOST, iface, 3), direct, 1),
-            (lambda: proxy_ms(port), proxy, 3),
+            (probe, proxy, 3),
         ]))
+        probes, routes = background.result()
     gl, gp = summary("Роутер", gw)
     summary("Интернет", direct)
     pl, pp = summary("Через VPN", proxy)
     here, there = location(["--interface", iface]), location(["-x", f"socks5h://127.0.0.1:{port}"])
     print(f"Выход:       прямой {here or '?'}, через VPN {there or '?'}")
+    used = collections.Counter(t for t in tags if t)
+    if used:
+        print("Серверы:     " + ", ".join(f"{t} {c}" for t, c in used.most_common()))
     print()
     if gl > 2 or gp is None or gp > 200:
+        state = "LOCAL"
         print("Вывод: проблема в Wi-Fi/роутере. Смена сервера и перезапуск VPN это не вылечат.")
+    elif used.get("DIRECT"):
+        state = "LEAK"
+        print("Вывод: часть проверок ушла напрямую, мимо VPN: серверы Happ не отвечают.")
     elif pl > 10 or pp is None or pp > 2000:
+        state = "VPN_BROKEN"
         print("Вывод: локальная сеть в порядке, виноваты VPN-серверы или маршрут до них.")
     else:
+        state = "OK"
         print("Вывод: все уровни в норме.")
     if here and here == there:
         print("Внимание: выход через VPN в той же стране, что и прямой. Возможен обход VPN (fallback в DIRECT).")
+    if probes:
+        print("\nСерверы напрямую, мимо туннеля:")
+        print_servers(probes, servers())
+    print("\nРаздельная маршрутизация:")
+    print_routes(routes)
+    tips = advice(state, probes, routes)
+    if tips:
+        print("\nЧто сделать:")
+        for t in tips:
+            print(textwrap.fill(t, 100, initial_indent="  • ", subsequent_indent="    "))
 
 
 def cmd_watch(a):
-    port, streak, last_restart, restarts, prev = socks_port(), 0, 0.0, [], None
+    port, streak, down, last_restart, restarts, prev = socks_port(), 0, 0, 0.0, [], None
     tick = 0
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     print(f"vpnguard следит, шаг {a.interval} с, журнал {LOG}", flush=True)
@@ -210,13 +522,22 @@ def cmd_watch(a):
         log(**r)
         if r["state"] != prev:
             print(time.strftime("%H:%M:%S"), LABELS[r["state"]], flush=True)
+            if r["state"] == "LEAK":
+                notify("Все серверы VPN недоступны, трафик идёт напрямую. Пробую починить.")
             prev = r["state"]
-        streak = streak + 1 if r["state"] == "VPN_BROKEN" else 0
+        streak = streak + 1 if r["state"] in BROKEN else 0
+        down = down + 1 if r["state"] == "VPN_DOWN" else 0
         now = time.time()
         restarts = [t for t in restarts if now - t < 3600]
+        if a.keep_on and down >= a.fails and not a.dry_run:
+            done = start_tunnel()
+            log(event="start", ok=done)
+            notify("Туннель был выключен, включил обратно" if done else "Не удалось включить туннель")
+            down = 0
         if streak >= a.fails and now - last_restart >= a.cooldown:
             if len(restarts) >= a.max_per_hour:
-                notify("VPN не работает, а лимит перезапусков исчерпан. Смени сервер в Happ.")
+                tips = advice(r["state"], probe_servers())
+                notify(tips[0] if tips else "VPN не работает, а лимит перезапусков исчерпан. Смени сервер в Happ.")
                 log(event="limit")
                 last_restart = now
             elif a.dry_run:
@@ -224,14 +545,25 @@ def cmd_watch(a):
                 last_restart = now
             else:
                 done = restart_tunnel()
-                log(event="restart", ok=done)
-                notify("Туннель перезапущен" if done else "Не удалось перезапустить туннель")
+                time.sleep(5)
+                after = sample(port)["state"] if done else r["state"]
+                log(event="restart", ok=done and after == "OK")
+                if after == "OK":
+                    notify("Туннель перезапущен, VPN снова работает")
+                else:
+                    # перезапуск не помог: смотрим серверы мимо туннеля и говорим, что делать
+                    tips = advice(after, probe_servers())
+                    notify(tips[0] if tips else "Перезапуск не помог")
                 restarts.append(now)
                 last_restart, streak = now, 0
         if tick % 40 == 1 and r["state"] == "OK":
             here, there = location(["--interface", route()[1]]), location(["-x", f"socks5h://127.0.0.1:{port}"])
             leak = bool(here and here == there)
             log(event="exit", direct=here, vpn=there, leak=leak)
+        if tick % 360 == 1:
+            ru = access_stats()["ru"]
+            if ru:
+                log(event="ru_vpn", hosts=dict(ru.most_common(10)))
         time.sleep(a.interval)
 
 
@@ -244,8 +576,9 @@ def cmd_restart(a):
 def cmd_report(a):
     since = time.time() - a.hours * 3600
     rows = []
-    if LOG.exists():
-        rows = [e for e in map(json.loads, LOG.read_text().splitlines()) if e["t"] >= since]
+    for path in (LOG.with_suffix(".old"), LOG):
+        if path.exists():
+            rows += [e for e in map(json.loads, path.read_text().splitlines()) if e["t"] >= since]
     states = [e["state"] for e in rows if "state" in e]
     if not states:
         print("Данных пока нет: запусти vpnguard install или vpnguard watch.")
@@ -257,17 +590,88 @@ def cmd_report(a):
             print(f"  {100 * c / len(states):5.1f}%  {text}")
     fixes = [e for e in rows if e.get("event") == "restart"]
     print(f"Перезапусков туннеля: {len(fixes)}, успешных: {sum(1 for e in fixes if e['ok'])}")
+    used = collections.Counter(e["tag"] for e in rows if e.get("tag"))
+    if used:
+        print("Серверы в проверках: " + ", ".join(f"{t} {100 * c / sum(used.values()):.0f}%" for t, c in used.most_common()))
     leaks = sum(1 for e in rows if e.get("leak"))
     if leaks:
         print(f"Выход в своей стране замечен {leaks} раз: возможен обход VPN.")
+    ru = access_stats()["ru"]
+    if ru:
+        print("Российские сайты через VPN: " + ", ".join(f"{h} ({n})" for h, n in ru.most_common(8)))
+
+
+def cmd_routes(a):
+    print("Открываю эталонные сайты через Happ…")
+    rows = route_check(socks_port())
+    print_routes(rows)
+    st = access_stats()
+    total = sum(st["tags"].values()) or 1
+    direct, block = st["tags"]["DIRECT"], st["tags"]["BLOCK"]
+    print(f"\nПо журналу Happ: напрямую {100 * direct / total:.0f}%, через VPN "
+          f"{100 * (total - direct - block) / total:.0f}%, заблокировано {100 * block / total:.0f}%")
+    if st["ru"]:
+        print("Российские сайты, ушедшие в VPN: " + ", ".join(f"{h} ({n})" for h, n in st["ru"].most_common(10)))
+    else:
+        print("Российские сайты в журнале идут напрямую.")
+    for t in advice("OK", [], rows):
+        print(textwrap.fill(t, 100, initial_indent="  • ", subsequent_indent="    "))
+    return 0 if all(r["right"] for r in rows) else 1
+
+
+def cmd_servers(a):
+    probes, shares = probe_servers(), servers()
+    if probes:
+        print_servers(probes, shares)
+        for t in advice("OK", probes):
+            print(textwrap.fill(t, 100, initial_indent="  • ", subsequent_indent="    "))
+        return 0 if not any(p["err"] for p in probes) else 1
+    if not happ_config():
+        print(f"Конфиг Happ не импортирован, адресов серверов нет. Импорт: vpn config <файл.json>\n")
+    if not shares:
+        print("В журнале Happ нет данных о серверах.")
+    for tag, share in shares:
+        print(f"{tag:12} {'█' * round(share * 30):30} {share * 100:4.0f}%")
+
+
+def cmd_config(a):
+    if not a.file:
+        conf = happ_config()
+        if not conf:
+            print(f"Конфиг не импортирован. Скопируй JSON сервера в Happ и выполни: pbpaste | vpn config -")
+            return 1
+        print(f"Конфиг: {CONF}\nЛокация: {conf.get('remarks', '?')}")
+        for s in server_list(conf):
+            print(f"  {s['tag']:10} {s['proto']} {s['host']}:{s['port']} {s['net']}/{s['sec']}")
+        if any(b.get("fallbackTag") == "DIRECT" for b in conf.get("routing", {}).get("balancers", [])):
+            print("При падении всех серверов балансировщик пускает трафик напрямую. vpnguard это видит "
+                  "(состояние «Обход VPN») и чинит.")
+        return 0
+    text = sys.stdin.read() if a.file == "-" else Path(a.file).expanduser().read_text()
+    conf = json.loads(text)
+    if not server_list(conf):
+        print("В JSON нет серверов (outbounds с vnext/servers)")
+        return 1
+    CONF.parent.mkdir(parents=True, exist_ok=True)
+    CONF.write_text(json.dumps(conf, ensure_ascii=False, indent=1))
+    CONF.chmod(0o600)  # в конфиге ключи доступа к серверам
+    print(f"Сохранено: {CONF}, серверов {len(server_list(conf))}")
+
+
+def c256(n):
+    return f"\033[38;5;{n}m"
 
 
 GREEN, YELLOW, RED, DIM, RESET = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
-
-
 CYAN, BOLD = "\033[36m", "\033[1m"
 ANSI = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
 THRESHOLDS = dict(gw=100, direct=300, proxy=1500)
+# Палитра в духе btop: градиент от зелёного к красному и свой цвет рамки у каждой панели
+GRAD = [c256(n) for n in (35, 71, 107, 143, 179, 215, 209, 203, 197, 161)]
+MUTED, TEXT = c256(244), c256(252)
+FRAME = dict(main=c256(73), net=c256(141), srv=c256(179), route=c256(108), conn=c256(174))
+STATE_COLOR = dict(OK=c256(78), LOCAL=c256(221), ISP=c256(221), VPN_BROKEN=c256(203), LEAK=c256(203),
+                   VPN_DOWN=c256(203))
 
 
 def visible(text):
@@ -278,20 +682,27 @@ def pad(text, width):
     return text + " " * max(width - visible(text), 0)
 
 
-def box(title, rows, width):
+def cut(text, width):
+    text = str(text)
+    return text if len(text) <= width else text[:max(width - 1, 0)] + "…"
+
+
+def box(title, rows, width, color=CYAN, height=None, hint=""):
+    """Рамка как в btop: заголовок и подсказка врезаны в верхнюю линию."""
     inner = width - 4
-    top = f"{CYAN}╭─ {RESET}{BOLD}{title}{RESET}{CYAN} {'─' * max(width - visible(title) - 5, 0)}╮{RESET}"
-    body = [f"{CYAN}│{RESET} {pad(r, inner)} {CYAN}│{RESET}" for r in rows]
-    return [top, *body, f"{CYAN}╰{'─' * (width - 2)}╯{RESET}"]
+    rows = list(rows)[:height - 2] if height else list(rows)
+    if height:
+        rows += [""] * (height - 2 - len(rows))
+    head = f"{color}╭─┤{RESET}{BOLD}{TEXT}{title}{RESET}{color}├"
+    tail = f"┤{RESET}{MUTED}{hint}{RESET}{color}├─╮{RESET}" if hint else f"─╮{RESET}"
+    fill = width - visible(head) - visible(tail)
+    top = head + "─" * max(fill, 0) + tail
+    body = [f"{color}│{RESET} {pad(r, inner)} {color}│{RESET}" for r in rows]
+    return [top, *body, f"{color}╰{'─' * (width - 2)}╯{RESET}"]
 
 
 def beside(left, right):
-    height = max(len(left), len(right))
-    lw, rw = visible(left[0]), visible(right[0])
-    # Нижняя рамка короткой колонки опускается вровень с соседней
-    def stretch(b, w):
-        return b[:-1] + [pad(f"{CYAN}│{RESET}", w - 1) + f"{CYAN}│{RESET}"] * (height - len(b)) + b[-1:]
-    return [a + " " + b for a, b in zip(stretch(left, lw), stretch(right, rw))]
+    return [a + " " + b for a, b in zip(left, right)]
 
 
 def center(text, width):
@@ -299,49 +710,74 @@ def center(text, width):
     return pad(" " * left + text, width)
 
 
-def braille(values, width, height, slow):
-    """Линейный график шрифтом Брайля: в одной клетке 2×4 точки, поэтому линия плавная."""
-    dots = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]]
-    cells = [[0] * width for _ in range(height)]
-    colors = [[GREEN] * width for _ in range(height)]
-    values = values[-width * 2:]
-    ok = [v for v in values if v is not None]
-    if ok:  # логарифмическая шкала: иначе обычная задержка не видна рядом с пиками
-        lo, hi = math.log(max(min(ok), 1)), math.log(max(max(ok), 1))
-        hi = max(hi, lo + math.log(2))
-        last = None
-        top = height * 4 - 1
-        for i, v in enumerate(values):
-            x = width * 2 - len(values) + i
-            if v is None:
-                y, span, color = 0, [0], RED
-            else:
-                y = top - round((math.log(max(v, 1)) - lo) / (hi - lo) * top)
-                span = range(min(y, last if last is not None else y), max(y, last if last is not None else y) + 1)
-                color = YELLOW if v > slow else GREEN
-                last = y
-            for row in span:
-                cells[row // 4][x // 2] |= dots[row % 4][x % 2]
-                colors[row // 4][x // 2] = color
-    return ["".join(f"{colors[r][c]}{chr(0x2800 + cells[r][c])}{RESET}" for c in range(width)) for r in range(height)]
+def fit(parts, width, sep="   "):
+    out = ""
+    for p in parts:
+        cand = out + (sep if out else "") + p
+        if visible(cand) > width:
+            break
+        out = cand
+    return out
+
+
+def grad(frac):
+    return GRAD[min(max(int(frac * len(GRAD)), 0), len(GRAD) - 1)]
+
+
+def graph(values, width, height, top=None, log_scale=False):
+    """Площадной график Брайлем: два замера на клетку, заливка снизу, цвет по высоте.
+
+    Без явного потолка шкала идёт по 95-му перцентилю: один пик не сплющивает весь график.
+    """
+    if width <= 0 or height <= 0:
+        return []
+    left_bits, right_bits = (0x40, 0x04, 0x02, 0x01), (0x80, 0x20, 0x10, 0x08)  # снизу вверх
+    vals = list(values[-width * 2:])
+    vals = [False] * (width * 2 - len(vals)) + vals  # False: истории ещё нет, None: сбой
+    ok = [v for v in vals if v not in (None, False)]
+    hi = top or (sorted(ok)[int(len(ok) * .95) - 1 if len(ok) > 1 else 0] * 1.3 if ok else 1) or 1
+    lo = min(ok) * 0.85 if ok and log_scale else 1
+    dots = height * 4
+
+    def level(v):
+        if v is None:
+            return dots
+        if v is False or v <= 0:
+            return 0
+        frac = math.log(max(v, lo) / lo) / math.log(max(hi / lo, 1.01)) if log_scale else v / hi
+        return max(min(round(frac * dots), dots), 1)
+
+    levels = [level(v) for v in vals]
+    out = []
+    for row in range(height):
+        base = (height - 1 - row) * 4
+        line = []
+        for col in range(width):
+            pair = levels[col * 2:col * 2 + 2]
+            failed = vals[col * 2] is None or vals[col * 2 + 1] is None
+            bits = 0
+            for lv, table in zip(pair, (left_bits, right_bits)):
+                for d in range(min(max(lv - base, 0), 4)):
+                    bits |= table[d]
+            if not bits:
+                line.append(" ")
+                continue
+            color = c256(160) if failed else grad((base + 2) / dots)
+            line.append(f"{color}{chr(0x2800 + bits)}")
+        out.append("".join(line) + RESET)
+    return out
+
+
+def bar(frac, width, color=None):
+    """Полоса из ■ как в btop: градиент по длине либо один цвет."""
+    width = max(width, 1)
+    n = round(min(max(frac, 0), 1) * width)
+    filled = "".join(f"{color or grad(i / width)}■" for i in range(n))
+    return f"{filled}{c256(238)}{'■' * (width - n)}{RESET}"
 
 
 def short_ms(v):
     return "—" if v is None else f"{v / 1000:.1f} с" if v >= 1000 else f"{v:.0f} мс"
-
-
-def chart(title, values, width, slow):
-    plot = width - 11
-    ok = [v for v in values if v is not None]
-    lines = braille(values, plot, 4, slow)
-    hi, lo = (max(ok), min(ok)) if ok else (None, None)
-    rows = [f"{DIM}{short_ms(hi):>6}┤{RESET}{lines[0]}", f"{DIM}{'':6}│{RESET}{lines[1]}",
-            f"{DIM}{'':6}│{RESET}{lines[2]}", f"{DIM}{short_ms(lo):>6}┤{RESET}{lines[3]}"]
-    avg = short_ms(statistics.mean(ok)) if ok else "—"
-    now = short_ms(values[-1]) if values else "—"
-    extra = f"  {DIM}потери{RESET} {loss_pct(values):.0f}%" if width >= 46 else ""
-    rows.append(center(f"{DIM}сейчас{RESET} {now}  {DIM}среднее{RESET} {avg}{extra}", width - 4))
-    return box(title, rows, width)
 
 
 def loss_pct(values):
@@ -378,41 +814,8 @@ def wifi_info():
     return dict(signal=int(signal.group(1)) if signal else None, channel=channel.group(1) if channel else None)
 
 
-def tile(title, value, width, color=""):
-    return box(title, [center(f"{BOLD}{color}{value}{RESET}", width - 4)], width)
-
-
-def row_of(items, width):
-    """Плитки в ряд; остаток ширины раздаётся слева, чтобы края совпали с другими рамками."""
-    n = len(items)
-    base, extra = (width - (n - 1)) // n, (width - (n - 1)) % n
-    built = [tile(t, v, base + (i < extra), c) for i, (t, v, c) in enumerate(items)]
-    line = built[0]
-    for b in built[1:]:
-        line = beside(line, b)
-    return line
-
-
 def paint_level(value, warn, bad):
-    return RED if value >= bad else YELLOW if value >= warn else GREEN
-
-
-def meter(share, width, color=GREEN):
-    fill = round(share * width)
-    return f"{color}{'▰' * fill}{RESET}{DIM}{'▱' * (width - fill)}{RESET}"
-
-
-def servers():
-    """Какие серверы Happ реально использует: доля соединений в хвосте журнала."""
-    try:
-        with ACCESS_LOG.open("rb") as f:
-            f.seek(max(ACCESS_LOG.stat().st_size - 400_000, 0))
-            text = f.read().decode(errors="ignore")
-    except OSError:
-        return []
-    tags = collections.Counter(re.findall(r"-> ((?:proxy|wl|yt)[\w-]*)\]", text))
-    total = sum(tags.values()) or 1
-    return [(tag, n / total) for tag, n in tags.most_common()]
+    return c256(203) if value >= bad else c256(221) if value >= warn else c256(78)
 
 
 def stats(hours=24):
@@ -456,8 +859,7 @@ def speed_once(path_args):
 
 
 def speed_test(port):
-    with cf.ThreadPoolExecutor(1) as ex:
-        vpn = ex.submit(speed_once, ["-x", f"socks5h://127.0.0.1:{port}"]).result()
+    vpn = speed_once(["-x", f"socks5h://127.0.0.1:{port}"])
     direct = speed_once(["--interface", route()[1] or "en0"])
     log(event="speed", vpn=vpn, direct=direct)
     return dict(t=time.time(), vpn=vpn, direct=direct)
@@ -475,137 +877,274 @@ def cmd_speed(a):
         print(f"{name:12}{ANSI.sub('', mbit(r[key]['down'])):>12}{ANSI.sub('', mbit(r[key]['up'])):>12}")
 
 
-def cmd_servers(a):
-    rows = servers()
-    if not rows:
-        print("В журнале Happ нет данных о серверах.")
-    for tag, share in rows:
-        print(f"{tag:12} {'█' * round(share * 30):30} {share * 100:4.0f}%")
+def tag_color(tag):
+    return c256(108) if tag == "DIRECT" else c256(167) if tag == "BLOCK" else c256(111)
+
+
+def panel_main(s, w, h):
+    r = s["r"]
+    state = r["state"] if r else None
+    color = STATE_COLOR.get(state, MUTED)
+    label = LABELS_SHORT.get(state, "проверяю…")
+    exits = s["exit"]
+    route_text = f"{exits[0] or '?'} → {exits[1] or '?'}" if exits else "…"
+    conf = s["conf"] or {}
+    srv = (r or {}).get("tag") or "?"
+    status = fit([f"{BOLD}{color}● {label}{RESET}",
+                  f"{MUTED}туннель{RESET} {c256(78) + 'вкл' if r and r['vpn'] else c256(203) + 'выкл'}{RESET}",
+                  f"{MUTED}выход{RESET} {route_text}",
+                  f"{MUTED}сервер{RESET} {tag_color(srv)}{srv}{RESET}" + (f" {MUTED}·{RESET} {conf['remarks']}" if conf.get("remarks") else ""),
+                  f"{MUTED}сторож{RESET} {c256(78) + '●' if s['watcher'] else c256(203) + '○'}{RESET}"], w - 4)
+    if state and state != "OK":
+        status = fit([status, f"{color}{LABELS[state]}{RESET}"], w - 4)
+
+    side = max(min(w // 3, 40), 28)
+    gw_ = w - 4 - side - 3
+    hist = s["hist"]
+    plot = graph(hist["proxy"], gw_, h - 4, log_scale=True)
+    ok = [v for v in hist["proxy"] if v is not None]
+    scale = f"{MUTED}макс {short_ms(max(ok)) if ok else '—'}  среднее {short_ms(statistics.mean(ok)) if ok else '—'}{RESET}"
+
+    score, jit = quality(s["states"], hist["proxy"]), jitter(hist["proxy"])
+    loss = loss_pct(hist["proxy"][-40:])
+    wifi = s["wifi"] or {}
+    sig = wifi.get("signal")
+    bw = side - 22
+
+    def meter(name, value, frac, color=None):
+        return f"{MUTED}{name:<10}{RESET}{value:>9} {bar(frac, bw, color)}"
+
+    last = lambda k: hist[k][-1] if hist[k] else None
+    rows = [
+        meter("Качество", f"{score}/100" if score is not None else "…", (score or 0) / 100,
+              paint_level(100 - (score or 100), 15, 40)),
+        meter("Через VPN", short_ms(last("proxy")), min((last("proxy") or 0) / 1500, 1)),
+        meter("Роутер", short_ms(last("gw")), min((last("gw") or 0) / 100, 1)),
+        meter("Интернет", short_ms(last("direct")), min((last("direct") or 0) / 300, 1)),
+        meter("Джиттер", short_ms(jit), min((jit or 0) / 300, 1)),
+        meter("Потери", f"{loss:.0f}%", loss / 20),
+        meter("Wi-Fi", f"{sig} дБм" if sig else "…", (sig + 90) / 60 if sig else 0,
+              paint_level(-sig, 67, 75) if sig else None),
+    ]
+    if wifi.get("channel"):
+        rows.append(f"{MUTED}{'Канал':<10}{RESET}{wifi['channel']:>9}")
+    sep = f"{FRAME['main']}│{RESET}"
+    body = [status, ""]
+    for i in range(h - 4):
+        left = plot[i] if i < len(plot) else ""
+        if i == h - 5:
+            left = scale
+        body.append(pad(left, gw_) + f" {sep} " + (rows[i] if i < len(rows) else ""))
+    return box("Задержка через VPN", body, w, FRAME["main"], h, time.strftime("%H:%M:%S"))
+
+
+def panel_net(s, w, h):
+    down, up = s["net"]
+    content = h - 2
+    gd = max((content - 3) // 2 + (content - 3) % 2, 1)
+    gu = max(content - 3 - gd, 0)
+    top = max(max(down[-(w * 2):], default=0), max(up[-(w * 2):], default=0), 1) * 1.1
+    rate = s["rate"]
+    rows = [f"{c256(141)}↓{RESET} {BOLD}{rate[0]:.1f}{RESET} {MUTED}Мбит/с   макс {max(down, default=0):.1f}{RESET}" if rate
+            else f"{MUTED}↓ …{RESET}"]
+    rows += graph(down, w - 4, gd, top)
+    rows.append(f"{c256(209)}↑{RESET} {BOLD}{rate[1]:.1f}{RESET} {MUTED}Мбит/с   макс {max(up, default=0):.1f}{RESET}" if rate
+                else f"{MUTED}↑ …{RESET}")
+    rows += graph(up, w - 4, gu, top)
+    sp = s["speed"] or (s["stats"]["speed"] if s["stats"] else None)
+    if s["speed_busy"]:
+        rows.append(f"{c256(221)}идёт замер скорости…{RESET}")
+    elif sp:
+        rows.append(f"{MUTED}тест{RESET} VPN ↓{mbit(sp['vpn']['down'])} ↑{mbit(sp['vpn']['up'])}  "
+                    f"{MUTED}напрямую{RESET} ↓{mbit(sp['direct']['down'])} ↑{mbit(sp['direct']['up'])}")
+    else:
+        rows.append(f"{MUTED}[s] замер скорости{RESET}")
+    return box("Сеть", rows, w, FRAME["net"], h, s["iface"] or "")
+
+
+def panel_servers(s, w, h):
+    share = dict(s["servers"])
+    probes = s["probes"]
+    active = (s["r"] or {}).get("tag")
+    inner = w - 4
+    rows = []
+    if probes:
+        host_w = max(inner - 36, 8)
+        rows.append(f"{MUTED}  {'сервер':<9}{'адрес':<{host_w}} {'TLS':>7}  доля{RESET}")
+        for p in probes:
+            dot = f"{c256(203)}●" if p["err"] else f"{c256(78)}●"
+            mark = f"{BOLD}{TEXT}" if p["tag"] == active else ""
+            tls = f"{c256(203)}{p['err']:>7}{RESET}" if p["err"] else f"{short_ms(p['tls']):>7}"
+            frac = share.get(p["tag"], 0)
+            rows.append(f"{dot}{RESET} {mark}{cut(p['tag'], 8):<9}{RESET}{MUTED}{cut(p['host'], host_w):<{host_w}}{RESET} "
+                        f"{tls}  {bar(frac, 8, c256(179))} {frac * 100:3.0f}%")
+    elif s["conf"] is None:
+        rows.append(f"{MUTED}конфиг не импортирован: vpn config <файл>{RESET}")
+        for tag, frac in s["servers"][:h - 3]:
+            rows.append(f"{cut(tag, 10):<10} {bar(frac, inner - 16, c256(179))} {frac * 100:3.0f}%")
+    else:
+        rows.append(f"{MUTED}проверяю серверы…{RESET}")
+    return box("Серверы", rows, w, FRAME["srv"], h, "напрямую, мимо VPN")
+
+
+def panel_routes(s, w, h):
+    st = s["access"]
+    rows = []
+    inner = w - 4
+    if st:
+        tags = st["tags"]
+        total = sum(tags.values()) or 1
+        vpn = total - tags["DIRECT"] - tags["BLOCK"]
+        for name, n, color in (("Напрямую", tags["DIRECT"], c256(108)), ("Через VPN", vpn, c256(111)),
+                               ("Блок", tags["BLOCK"], c256(167))):
+            rows.append(f"{MUTED}{name:<10}{RESET}{bar(n / total, inner - 16, color)} {100 * n / total:3.0f}%")
+        if st["ru"]:
+            hosts = ", ".join(h for h, _ in st["ru"].most_common(4))
+            rows.append(f"{c256(221)}RU через VPN:{RESET} {cut(hosts, inner - 14)}")
+        else:
+            rows.append(f"{c256(78)}✓{RESET} {MUTED}RU-сайты идут напрямую{RESET}")
+    if s["routes_busy"]:
+        rows.append(f"{c256(221)}проверяю маршруты…{RESET}")
+    elif s["routes"]:
+        cells = []
+        for r in s["routes"]:
+            ok = r["right"] and r["works"]
+            mark = f"{c256(78)}✓" if ok else f"{c256(221)}!" if r["right"] else f"{c256(203)}✗"
+            cells.append(f"{mark}{RESET} {cut(r['host'].removeprefix('www.'), 12):<12}")
+        per = max(inner // 15, 1)
+        rows += ["  ".join(cells[i:i + per]) for i in range(0, len(cells), per)]
+    else:
+        rows.append(f"{MUTED}[t] проверить RU напрямую / мир через VPN{RESET}")
+    stt = s["stats"]
+    if stt and stt["total"]:
+        c, total = stt["states"], stt["total"]
+        rows.append(f"{MUTED}24 ч:{RESET} норма {100 * c['OK'] / total:.1f}%  "
+                    f"{MUTED}сбоев VPN{RESET} {100 * sum(c[k] for k in BROKEN) / total:.1f}%  "
+                    f"{MUTED}перезапусков{RESET} {stt['fixes']}")
+    return box("Маршруты", rows, w, FRAME["route"], h, "t тест")
+
+
+def panel_conns(s, w, h):
+    st = s["access"]
+    inner = w - 4
+    name_w = inner - 22
+    rows = [f"{MUTED}{'кто':<{name_w}}{'стр':<4}{'маршрут':<10}{'соед.':>8}{RESET}"]
+    if st:
+        for (host, tag), n in st["hosts"].most_common(h - 3):
+            warn = c256(221) if tag not in SERVICE_TAGS and is_ru_host(host) else ""
+            cc = (IP_INFO.get(host) or {}).get("cc") or ""
+            rows.append(f"{warn}{cut(host_label(host), name_w - 1):<{name_w}}{RESET}{MUTED}{cc:<4}{RESET}"
+                        f"{tag_color(tag)}{cut(tag, 9):<10}{RESET}{n:>8}")
+    return box("Соединения", rows, w, FRAME["conn"], h, "из журнала Happ")
 
 
 def draw(s):
     cols, lines_max = shutil.get_terminal_size((100, 30))
-    w = min(max(cols - 2, 60), 100)
-    r, hist = s["r"], s["hist"]
-    label = LABELS[r["state"]] if r else "проверяю…"
-    color = GREEN if r and r["state"] == "OK" else RED if r else DIM
-    guard = f"{GREEN}активен{RESET}" if s["watcher"] else f"{RED}не запущен{RESET}"
-    st = s["stats"]
-    exits = s["exit"]
-    route_text = f"{exits[0] or '?'} → {exits[1] or '?'}" if exits else "…"
-    head = box("VPN", [center(f"{BOLD}{color}● {label}{RESET}", w - 4),
-                       center(f"{DIM}Туннель{RESET} {GREEN + 'включён' if r and r['vpn'] else RED + 'выключен'}{RESET}"
-                              f"    {DIM}Выход{RESET} {route_text}    {DIM}Сторож{RESET} {guard}", w - 4)], w)
-
-    score, jit = quality(s["states"], hist["proxy"]), jitter(hist["proxy"])
-    loss = loss_pct(hist["proxy"][-40:])
-    wifi, rate = s["wifi"] or {}, s["rate"]
-    signal = wifi.get("signal")
-    tiles = [("Качество", f"{score}/100" if score is not None else "…", GREEN if score is None else
-              paint_level(100 - score, 15, 40)),
-             ("Джиттер", short_ms(jit), YELLOW if jit and jit > 150 else GREEN),
-             ("Потери VPN", f"{loss:.0f}%", paint_level(loss, 2, 10)),
-             ("Wi-Fi", f"{signal} дБм" if signal else "…", RED if signal and signal < -75 else GREEN),
-             ("↓ Мбит/с", f"{rate[0]:.1f}" if rate else "…", CYAN),
-             ("↑ Мбит/с", f"{rate[1]:.1f}" if rate else "…", CYAN)]
-    tile_rows = row_of(tiles, w) if w >= 84 else row_of(tiles[:3], w) + row_of(tiles[3:], w)
-
-    left = (w - 1) // 2
-    right = w - 1 - left
-    charts = beside(chart("Задержка через VPN", hist["proxy"], left, THRESHOLDS["proxy"]),
-                    chart("Задержка до роутера", hist["gw"], right, THRESHOLDS["gw"]))
-    sp = s["speed"] or (st["speed"] if st else None)
-    if s["speed_busy"]:
-        speed_rows = [f"{YELLOW}идёт замер…{RESET}"]
-    elif sp:
-        speed_rows = [f"{DIM}{'':10}{'↓ Мбит/с':>10}{'↑ Мбит/с':>10}{RESET}"]
-        for name, key in (("VPN", "vpn"), ("Напрямую", "direct")):
-            d, u = mbit(sp[key]["down"]), mbit(sp[key]["up"])
-            speed_rows.append(f"{name:10}{' ' * (10 - visible(d))}{d}{' ' * (10 - visible(u))}{u}")
-        speed_rows.append(f"{DIM}замер {time.strftime('%d.%m %H:%M', time.localtime(sp['t']))}{RESET}")
-    else:
-        speed_rows = [f"{DIM}нажми [s] для замера{RESET}"]
-    if st and st["total"]:
-        total, c = st["total"], st["states"]
-        speed_panel_stats = [f"{pad(LABELS_SHORT[k], 10)} {meter(c[k] / total, right - 23, col)}  {100 * c[k] / total:5.1f}%"
-                             for k, col in (("OK", GREEN), ("LOCAL", YELLOW), ("VPN_BROKEN", RED)) if k in c or k == "OK"]
-        speed_panel_stats.append(f"{DIM}Автоперезапусков: {st['fixes']}{RESET}")
-    else:
-        speed_panel_stats = [f"{DIM}журнал пока пуст{RESET}"]
-    middle = beside(box("Скорость", speed_rows, left), box("Доступность за 24 ч", speed_panel_stats, right))
-
-    cell = (w - 4) // 2 - 2
-    items = [f"{tag:10} {meter(share, cell - 17, CYAN)} {share * 100:3.0f}%" for tag, share in s["servers"][:6]]
-    srv = [pad(a, cell + 2) + b for a, b in zip(items[::2], items[1::2] + [""])]
-    bottom = box("Серверы Happ, доля соединений", srv or [center(f"{DIM}нет данных{RESET}", w - 4)], w)
-
-    keys = center(f"{DIM}[s] скорость  [r] перезапуск  [d] диагностика  [l] отчёт  [q] выход{RESET}", w)
-    tail = [keys, center(s["note"], w)]
-    lines = list(head) + tile_rows
-    for section in (charts, middle, bottom):  # на низком экране нижние панели скрываются, клавиши остаются
-        if len(lines) + len(section) + len(tail) < lines_max:
-            lines += section
-    lines += tail
-    lines = lines[:max(lines_max - 1, 1)]
-    indent = " " * max((cols - w) // 2, 0)
-    top = max((lines_max - len(lines)) // 2, 0)
-    sys.stdout.write("\033[H" + "\033[K\n" * top + "\033[K\n".join(indent + l for l in lines) + "\033[K\033[J")
+    w = max(cols, 60)
+    avail = lines_max - 1
+    h_main = min(max(int(avail * 0.38), 9), 14)
+    rest = avail - h_main
+    lw = (w - 1) // 2
+    rw = w - 1 - lw
+    lines = panel_main(s, w, h_main)
+    if rest >= 18:
+        h1 = rest // 2
+        h2 = rest - h1
+        lines += beside(panel_net(s, lw, h1), panel_servers(s, rw, h1))
+        lines += beside(panel_routes(s, lw, h2), panel_conns(s, rw, h2))
+    elif rest >= 7:
+        lines += beside(panel_net(s, lw, rest), panel_servers(s, rw, rest))
+    keys = [("s", "скорость"), ("r", "перезапуск"), ("t", "маршруты"), ("d", "диагностика"), ("l", "отчёт"),
+            ("q", "выход")]
+    foot = "  ".join(f"{BOLD}{c256(215)}{k}{RESET} {MUTED}{t}{RESET}" for k, t in keys)
+    if s["note"]:
+        foot += f"   {c256(221)}{s['note']}{RESET}"
+    lines.append(pad(" " + foot, w))
+    lines = lines[:max(lines_max, 1)]
+    sys.stdout.write("\033[H" + "\033[K\n".join(lines) + "\033[K\033[J")
     sys.stdout.flush()
+
+
+def ui_state():
+    return dict(r=None, hist=dict(gw=[], direct=[], proxy=[]), note="", busy=False, dirty=True, exit=None,
+                stats=None, servers=[], watcher=False, speed=None, speed_busy=False, states=[], wifi=None,
+                rate=None, net=([], []), iface=None, probes=[], access=None, routes=None, routes_busy=False,
+                conf=happ_config())
+
+
+def load_history(state):
+    """Графики сразу показывают историю сторожа, а не пустое поле."""
+    if not LOG.exists():
+        return
+    for e in map(json.loads, LOG.read_text().splitlines()[-300:]):
+        if "state" in e:
+            state["states"].append(e["state"])
+            for key, values in state["hist"].items():
+                values.append(e[key])
+    for values in (*state["hist"].values(), state["states"]):
+        del values[:-400]
 
 
 def cmd_ui(a):
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         return cmd_status(a)
     port, fd, saved = socks_port(), sys.stdin.fileno(), termios.tcgetattr(sys.stdin)
-    state = dict(r=None, hist=dict(gw=[], direct=[], proxy=[]), note="", busy=False, dirty=True, exit=None,
-                 stats=None, servers=[], watcher=False, speed=None, speed_busy=False, states=[], wifi=None, rate=None)
+    state = ui_state()
     stop = threading.Event()
-    if LOG.exists():  # графики сразу показывают историю сторожа, а не пустое поле
-        for e in map(json.loads, LOG.read_text().splitlines()[-300:]):
-            if "state" in e:
-                state["states"].append(e["state"])
-                for key, values in state["hist"].items():
-                    values.append(e[key])
-        for values in (*state["hist"].values(), state["states"]):
-            del values[:-120]
+    load_history(state)
+
+    def every(seconds, fn):
+        def loop():
+            while not stop.is_set():
+                fn()
+                state["dirty"] = True
+                stop.wait(seconds)
+        threading.Thread(target=loop, daemon=True).start()
+
+    prev = [None]
 
     def traffic():
-        prev = None
-        while not stop.is_set():
-            iface, now = route()[1], time.time()
-            cur = counters(iface) if iface else None
-            if prev and cur:
-                gap = now - prev[0]
-                state["rate"] = ((cur[0] - prev[1][0]) * 8 / 1e6 / gap, (cur[1] - prev[1][1]) * 8 / 1e6 / gap)
-                state["dirty"] = True
-            prev = (now, cur) if cur else None
-            stop.wait(2)
+        iface, now = route()[1], time.time()
+        state["iface"] = iface
+        cur = counters(iface) if iface else None
+        if prev[0] and cur:
+            gap = now - prev[0][0]
+            state["rate"] = ((cur[0] - prev[0][1][0]) * 8 / 1e6 / gap, (cur[1] - prev[0][1][1]) * 8 / 1e6 / gap)
+            for values, v in zip(state["net"], state["rate"]):
+                values.append(v)
+                del values[:-400]
+        prev[0] = (now, cur) if cur else None
 
-    def slow_poller():
-        while not stop.is_set():
-            state.update(stats=stats(), servers=servers(), watcher=watcher_alive(), wifi=wifi_info(), dirty=True)
-            iface = route()[1]
-            state["exit"] = (location(["--interface", iface]) if iface else None,
-                             location(["-x", f"socks5h://127.0.0.1:{port}"]))
-            state["dirty"] = True
-            stop.wait(60)
+    def slow():
+        state.update(stats=stats(), watcher=watcher_alive(), wifi=wifi_info())
+        iface = route()[1]
+        state["exit"] = (location(["--interface", iface]) if iface else None,
+                         location(["-x", f"socks5h://127.0.0.1:{port}"]))
 
-    def poller():
-        while not stop.is_set():
-            if not state["busy"]:
-                r = sample(port)
-                state["r"] = r
-                for key, values in state["hist"].items():
-                    values.append(r[key])
-                    del values[:-120]
-                state["states"].append(r["state"])
-                del state["states"][:-120]
-                state["dirty"] = True
-            stop.wait(3)
+    def journal():
+        st = access_stats()
+        state.update(access=st, servers=servers(st))
+
+    def probe():
+        state["probes"] = probe_servers()
+
+    def tick():
+        if state["busy"]:
+            return
+        r = sample(port)
+        state["r"] = r
+        for key, values in state["hist"].items():
+            values.append(r[key])
+            del values[:-400]
+        state["states"].append(r["state"])
+        del state["states"][:-400]
 
     def measure():
         state["speed"] = speed_test(port)
         state.update(speed_busy=False, stats=stats(), dirty=True)
+
+    def check_routes():
+        state.update(routes=route_check(port), routes_busy=False, dirty=True)
 
     def restart():
         state["note"], state["dirty"] = "Перезапускаю туннель…", True
@@ -628,9 +1167,11 @@ def cmd_ui(a):
         enter()
         state["dirty"] = True
 
-    threading.Thread(target=poller, daemon=True).start()
-    threading.Thread(target=slow_poller, daemon=True).start()
-    threading.Thread(target=traffic, daemon=True).start()
+    every(2, tick)
+    every(1, traffic)
+    every(3, journal)
+    every(30, probe)
+    every(60, slow)
     enter()
     size = None
     try:
@@ -646,7 +1187,10 @@ def cmd_ui(a):
             if key in ("s", "ы") and not state["speed_busy"]:
                 state.update(speed_busy=True, dirty=True)
                 threading.Thread(target=measure, daemon=True).start()
-            if key in ("r", "к") and not state["busy"]:
+            elif key in ("t", "е") and not state["routes_busy"]:
+                state.update(routes_busy=True, dirty=True)
+                threading.Thread(target=check_routes, daemon=True).start()
+            elif key in ("r", "к") and not state["busy"]:
                 state["busy"] = True
                 threading.Thread(target=restart, daemon=True).start()
             elif key in ("d", "в"):
@@ -691,12 +1235,27 @@ def cmd_uninstall(a):
     print("Сторож удалён. Журнал оставлен:", LOG)
 
 
+class Plain:
+    """Вывод в файл или пайп без цветовых кодов."""
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, text):
+        return self.stream.write(ANSI.sub("", text))
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
 def main():
+    if not sys.stdout.isatty():
+        sys.stdout = Plain(sys.stdout)
     p = argparse.ArgumentParser(prog="vpn", description="Сторож VPN для Happ. Без команды открывает живую панель")
     p.set_defaults(fn=cmd_ui)
     s = p.add_subparsers(dest="cmd")
     s.add_parser("status", help="мгновенная проверка всех уровней").set_defaults(fn=cmd_status)
-    d = s.add_parser("doctor", help="замер и вывод, где проблема")
+    d = s.add_parser("doctor", help="замер, проверка серверов и маршрутов, советы")
     d.add_argument("seconds", nargs="?", type=int, default=30)
     d.set_defaults(fn=cmd_doctor)
     w = s.add_parser("watch", help="следить и чинить туннель")
@@ -704,10 +1263,15 @@ def main():
     w.add_argument("--fails", type=int, default=4, help="сбоев подряд до перезапуска")
     w.add_argument("--cooldown", type=int, default=180)
     w.add_argument("--max-per-hour", type=int, default=4)
+    w.add_argument("--keep-on", action="store_true", help="включать туннель, если его выключили")
     w.add_argument("--dry-run", action="store_true")
     w.set_defaults(fn=cmd_watch)
     s.add_parser("speed", help="замер скорости через VPN и напрямую").set_defaults(fn=cmd_speed)
-    s.add_parser("servers", help="какие серверы использует Happ").set_defaults(fn=cmd_servers)
+    s.add_parser("servers", help="доступность серверов мимо туннеля и их доля").set_defaults(fn=cmd_servers)
+    s.add_parser("routes", help="RU-сайты напрямую, остальные через VPN?").set_defaults(fn=cmd_routes)
+    c = s.add_parser("config", help="импорт JSON-конфига сервера из Happ (- читает stdin)")
+    c.add_argument("file", nargs="?")
+    c.set_defaults(fn=cmd_config)
     s.add_parser("restart", help="перезапустить туннель").set_defaults(fn=cmd_restart)
     r = s.add_parser("report", help="статистика из журнала")
     r.add_argument("hours", nargs="?", type=int, default=24)
